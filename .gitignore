@@ -1,0 +1,7 @@
+# 调试日志(如临时排查时生成)
+debug.log
+
+# 编辑器/系统杂项
+.DS_Store
+Thumbs.db
+*.swp
