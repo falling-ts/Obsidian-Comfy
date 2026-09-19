@@ -110,6 +110,25 @@
   max-width: var(--oc-other-max, 720px);
 }
 
+/* 数值列就地编辑框: 双击 INT/FLOAT 单元格时临时占据该格。
+   正在编辑的格子要放开裁剪, 否则输入框的焦点环会被 overflow:hidden 切掉 */
+.oc-clip .oc-cell-input {
+  width: 100%;
+  min-width: 4em;
+  box-sizing: border-box;
+  font: inherit;
+  line-height: 1.4;
+  color: var(--text-normal);
+  background: var(--background-modifier-form-field);
+  border: 1px solid var(--interactive-accent);
+  border-radius: var(--radius-s, 3px);
+  padding: 0 4px;
+}
+
+.oc-clip:has(.oc-cell-input) {
+  overflow: visible;
+}
+
 /* 单元格里的多媒体缩略图 */
 .oc-table-scroll td img.oc-inline-thumb {
   height: 22px;

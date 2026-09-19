@@ -11,6 +11,9 @@
  *   5. ID 列点击切换增序 / 降序
  *   6. 在表格内输入 @ 自动弹窗浏览 ComfyUI output 目录(仅普通文件 + 「数字-」编号目录),
  *      选中文件后确定, 自动插入 @{目录名/文件名} 或 @{文件名}
+ *   7. 双击单元格就地编辑: TEXT 弹多行编辑器; IMAGE/VIDEO/AUDIO/MASK 弹同一个文件
+ *      浏览器并写入 @{...}; INT/FLOAT 就地换成输入框, 失焦即写回
+ *   8. 所有写回都只替换目标单元格那一段字符, 同行其它格与文件其它内容一个字节不动
  */
 
 const obsidian = require('obsidian');
@@ -32,6 +35,12 @@ const AUDIO_EXT = new Set(['mp3', 'wav', 'flac', 'ogg', 'm4a', 'aac', 'opus']);
 
 /** 编号目录判据: 数字开头后接连字符, 例如 0040-文生视频 */
 const NUMBERED_DIR_RE = /^\d+-/;
+
+/** 引用型列: 双击弹 output 文件浏览器, 选中后把 `@{...}` 写回该格 */
+const REF_TYPES = new Set(['IMAGE', 'VIDEO', 'AUDIO', 'MASK']);
+
+/** 数值型列: 双击就地换成输入框, 失焦时写回该格 */
+const NUM_TYPES = new Set(['INT', 'FLOAT']);
 
 /** 默认设置 */
 const DEFAULT_SETTINGS = {
@@ -119,6 +128,20 @@ function splitCells(line) {
 }
 
 /**
+ * 把源文本按字面 `<br>` 切段, 供单元格重建显示时使用。
+ *
+ * 源码里的 `<br>` 是硬换行, 重建 DOM 时必须还原成 `<br>` 元素(再靠 CSS 隐藏),
+ * 这样 DOM 与源码始终一致; `\|` 是表格里的转义竖线, 显示时还原成 `|`。
+ *
+ * @param {string} text 源文本
+ * @returns {Array<{br: boolean, text: string}>} 段数组; br 为 true 表示该段之前有一个换行
+ */
+function splitBrText(text) {
+  const parts = String(text == null ? '' : text).split(/<br\s*\/?>/i);
+  return parts.map((seg, i) => ({ br: i > 0, text: seg.replace(/\\\|/g, '|') }));
+}
+
+/**
  * 提取 ID 的排序键: 取开头的数字段。
  *
  * @param {string} text 单元格文本, 例如 `00011-插入项`
@@ -192,6 +215,7 @@ class ComfyFileModal extends Modal {
    * @param {string} opts.root 根目录绝对路径
    * @param {string} opts.thumbMode `app` 或 `base64`
    * @param {number} opts.thumbWidth 缩略图宽度
+   * @param {string} [opts.title] 弹窗标题; 省略时用默认标题
    * @param {(text: string) => void} opts.onPick 确定回调, 收到 `@{...}`
    */
   constructor(app, opts) {
@@ -199,6 +223,7 @@ class ComfyFileModal extends Modal {
     this.root = opts.root;
     this.thumbMode = opts.thumbMode;
     this.thumbWidth = opts.thumbWidth;
+    this.modalTitle = opts.title || '插入 output 资源引用';
     this.onPick = opts.onPick;
 
     /** 当前所在子目录名; 空串表示根目录 */
@@ -216,7 +241,7 @@ class ComfyFileModal extends Modal {
    */
   onOpen() {
     this.modalEl.addClass('oc-modal');
-    this.titleEl.setText('插入 output 资源引用');
+    this.titleEl.setText(this.modalTitle);
     this.render();
   }
 
@@ -692,26 +717,176 @@ class ComfyTableChild extends MarkdownRenderChild {
   }
 
   /**
-   * 绑定 TEXT 单元格双击 → 弹窗查看/编辑。
+   * 绑定数据格双击 → 按列类型分派到对应编辑器。
    *
    * 走事件委托挂在容器上, 这样排序、分页、搜索重排行之后依然有效。
+   * 用 `td.oc-cell` 而不是内层裁剪容器定位, 所以空单元格也能双击。
    *
    * @returns {void}
    */
   bindEdit() {
     this.registerDomEvent(this.containerEl, 'dblclick', (ev) => {
-      const clip = ev.target && ev.target.closest ? ev.target.closest('.oc-clip-text') : null;
-      if (!clip) return;
-      const td = clip.closest('td');
-      const tr = clip.closest('tr');
-      if (!td || !tr) return;
+      const td = ev.target && ev.target.closest ? ev.target.closest('td.oc-cell') : null;
+      if (!td) return;
+      // 正在就地编辑的格子不重入
+      if (td.querySelector('.oc-cell-input')) return;
+      const tr = td.closest('tr');
+      if (!tr) return;
       const cells = Array.from(tr.children);
       const colIdx = cells.indexOf(td);
       if (colIdx < 1 || !cells[0]) return; // 第 0 列是 ID, 不可编辑
       ev.preventDefault();
       ev.stopPropagation();
-      this.openTextEditor(cells[0].textContent.trim(), colIdx);
+      this.editCell(cells[0].textContent.trim(), colIdx, td);
     });
+  }
+
+  /**
+   * 按该列声明的类型选择编辑器。
+   *
+   * IMAGE/VIDEO/AUDIO/MASK 走文件浏览器写 `@{...}`; INT/FLOAT 就地换输入框;
+   * 其余(含省略类型的 STRING、以及 TEXT)一律弹多行文本编辑器。
+   *
+   * @param {string} idText 目标行 ID
+   * @param {number} colIdx 目标列下标
+   * @param {HTMLElement} td 被双击的单元格
+   * @returns {void}
+   */
+  editCell(idText, colIdx, td) {
+    const type = this.types[colIdx] || 'STRING';
+    if (REF_TYPES.has(type)) {
+      this.pickRef(idText, colIdx);
+      return;
+    }
+    if (NUM_TYPES.has(type)) {
+      this.editNumber(idText, colIdx, td, type);
+      return;
+    }
+    this.openTextEditor(idText, colIdx);
+  }
+
+  /**
+   * IMAGE / VIDEO / AUDIO / MASK 列: 弹与 `@` 相同的文件浏览器, 选中即写回 `@{...}`。
+   *
+   * @param {string} idText 目标行 ID
+   * @param {number} colIdx 目标列下标
+   * @returns {void}
+   */
+  pickRef(idText, colIdx) {
+    const label = `${idText} · ${this.headers[colIdx] || ''}`;
+    this.plugin.openBrowser(
+      (ref) => this.writeCell(idText, colIdx, ref, label),
+      `选择引用 · ${label}`,
+    );
+  }
+
+  /**
+   * INT / FLOAT 列: 把静态文本就地换成输入框, 失焦或回车时写回。
+   *
+   * 初值只认源文件(与 TEXT 一样, 不认已被渲染处理过的 DOM)。内容没改、
+   * 按 Esc、或数值不合法时只还原显示, 一个字节都不写盘。
+   *
+   * @param {string} idText 目标行 ID
+   * @param {number} colIdx 目标列下标
+   * @param {HTMLElement} td 被双击的单元格
+   * @param {string} type `INT` 或 `FLOAT`
+   * @returns {Promise<void>}
+   */
+  async editNumber(idText, colIdx, td, type) {
+    const file = this.plugin.app.vault.getFileByPath(this.sourcePath);
+    if (!file) {
+      new Notice('找不到源文件, 无法编辑');
+      return;
+    }
+    const data = await this.plugin.app.vault.read(file);
+    const hit = locateCell(data, idText, colIdx);
+    if (!hit) {
+      new Notice(`源文件里没定位到 ${idText} 的这一列`);
+      return;
+    }
+
+    const original = hit.text.trim();
+    const clip = td.querySelector('.oc-clip') || td;
+    clip.empty();
+
+    const input = document.createElement('input');
+    input.addClass('oc-cell-input');
+    input.type = 'text';
+    input.inputMode = type === 'INT' ? 'numeric' : 'decimal';
+    input.spellcheck = false;
+    input.value = original;
+    clip.appendChild(input);
+    input.focus();
+    input.select();
+
+    let settled = false;
+    const finish = (commit) => {
+      if (settled) return;
+      settled = true;
+      const next = input.value.trim();
+      if (!commit || next === original) {
+        this.setCellDisplay(td, original);
+        return;
+      }
+      if (!this.validNumber(next, type)) {
+        new Notice(`${type} 列需要${type === 'INT' ? '整数' : '数字'}: ${next}`);
+        this.setCellDisplay(td, original);
+        return;
+      }
+      this.setCellDisplay(td, next);
+      this.writeCell(idText, colIdx, next, `${idText} · ${this.headers[colIdx] || ''}`);
+    };
+
+    input.addEventListener('blur', () => finish(true));
+    input.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        finish(true);
+        return;
+      }
+      if (ev.key === 'Escape') {
+        ev.preventDefault();
+        finish(false);
+      }
+    });
+  }
+
+  /**
+   * 校验数值列的新值; 空串视为清空该格。
+   *
+   * @param {string} text 待校验文本
+   * @param {string} type `INT` 或 `FLOAT`
+   * @returns {boolean} 是否合法
+   */
+  validNumber(text, type) {
+    if (text === '') return true;
+    if (type === 'INT') return /^[+-]?\d+$/.test(text);
+    return Number.isFinite(Number(text));
+  }
+
+  /**
+   * 用一段源文本重建单元格的显示。
+   *
+   * 写盘后表格 DOM 不会自己跟着变, 所以保存完要手动同步这一格。
+   * 重建规则与 wrapClip 一致: 源码里的字面 `<br>` 还原成 `<br>` 元素并隐藏,
+   * 渲染结果因此仍是单行; `\|` 还原成普通竖线。
+   *
+   * @param {HTMLElement} td 目标单元格
+   * @param {string} text 源文本
+   * @returns {void}
+   */
+  setCellDisplay(td, text) {
+    const clip = td.querySelector('.oc-clip') || td;
+    clip.empty();
+    for (const seg of splitBrText(text)) {
+      if (seg.br) {
+        clip.appendChild(document.createTextNode(' '));
+        const br = document.createElement('br');
+        br.addClass('oc-br-hidden');
+        clip.appendChild(br);
+      }
+      if (seg.text) clip.appendChild(document.createTextNode(seg.text));
+    }
   }
 
   /**
@@ -736,10 +911,11 @@ class ComfyTableChild extends MarkdownRenderChild {
       new Notice(`源文件里没定位到 ${idText} 的这一列`);
       return;
     }
+    const label = `${idText} · ${this.headers[colIdx] || ''}`;
     new ComfyTextModal(this.plugin.app, {
-      title: `${idText} · ${this.headers[colIdx] || ''}`,
+      title: label,
       value: hit.text.trim(),
-      onSave: (next) => this.writeCell(idText, colIdx, next),
+      onSave: (next) => this.writeCell(idText, colIdx, next, label),
     }).open();
   }
 
@@ -752,9 +928,10 @@ class ComfyTableChild extends MarkdownRenderChild {
    * @param {string} idText 目标行 ID
    * @param {number} colIdx 目标列下标
    * @param {string} next 新内容
+   * @param {string} [label] 提示里显示的名字; 省略时用 ID
    * @returns {Promise<void>}
    */
-  async writeCell(idText, colIdx, next) {
+  async writeCell(idText, colIdx, next, label) {
     const file = this.plugin.app.vault.getFileByPath(this.sourcePath);
     if (!file) {
       new Notice('找不到源文件, 保存失败');
@@ -770,7 +947,8 @@ class ComfyTableChild extends MarkdownRenderChild {
       done = true;
       return data.slice(0, hit.start) + lead + next + tail + data.slice(hit.end);
     });
-    new Notice(done ? `已保存 ${idText}` : `保存失败: 没定位到 ${idText}`);
+    const who = label || idText;
+    new Notice(done ? `已保存 ${who}` : `保存失败: 没定位到 ${who}`);
   }
 
   /**
@@ -789,8 +967,13 @@ class ComfyTableChild extends MarkdownRenderChild {
           td.addClass('oc-td-id');
           return;
         }
-        const isText = this.types[i] === 'TEXT';
+        const type = this.types[i] || 'STRING';
+        const isText = type === 'TEXT';
+        // oc-cell 是双击编辑的定位锚点: 空单元格没有内层容器, 只能靠它命中
+        td.addClass('oc-cell');
         td.addClass(isText ? 'oc-cell-text' : 'oc-cell-other');
+        if (REF_TYPES.has(type)) td.addClass('oc-cell-ref');
+        if (NUM_TYPES.has(type)) td.addClass('oc-cell-num');
         this.wrapClip(td, isText);
       });
     }
@@ -807,8 +990,6 @@ class ComfyTableChild extends MarkdownRenderChild {
    * @returns {void}
    */
   wrapClip(td, isText) {
-    // 空单元格不必包装
-    if (!td.firstChild) return;
     // 源 md 的 TEXT 单元格用 <br> 分隔多段文字。 <br> 是硬换行, white-space:nowrap
     // 管不了它, 单元格会照旧撑成多行。 这里保留 <br> 本身(源码与 DOM 都不动它),
     // 只在它前面补一个空格、并打上隐藏类, 于是渲染结果摊平成一行, 截断交给上面的省略号。
@@ -1261,13 +1442,15 @@ class ComfyPlugin extends Plugin {
    * 打开文件浏览器弹窗。
    *
    * @param {(ref: string) => void} onPick 选中回调
+   * @param {string} [title] 弹窗标题; 省略时用默认标题
    * @returns {void}
    */
-  openBrowser(onPick) {
+  openBrowser(onPick, title) {
     new ComfyFileModal(this.app, {
       root: this.settings.outputDir,
       thumbMode: this.settings.thumbMode,
       thumbWidth: this.settings.thumbWidth,
+      title,
       onPick,
     }).open();
   }
