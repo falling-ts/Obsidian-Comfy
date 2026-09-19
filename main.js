@@ -569,6 +569,13 @@ class ComfyTableChild extends MarkdownRenderChild {
   wrapClip(td, isText) {
     // 空单元格不必包装
     if (!td.firstChild) return;
+    // 源 md 的 TEXT 单元格用 <br> 分隔多段文字。 <br> 是硬换行, white-space:nowrap
+    // 管不了它, 单元格会照旧撑成多行。 这里保留 <br> 本身(源码与 DOM 都不动它),
+    // 只在它前面补一个空格、并打上隐藏类, 于是渲染结果摊平成一行, 截断交给上面的省略号。
+    for (const br of Array.from(td.querySelectorAll('br'))) {
+      br.before(document.createTextNode(' '));
+      br.addClass('oc-br-hidden');
+    }
     const box = document.createElement('div');
     box.addClass('oc-clip');
     box.addClass(isText ? 'oc-clip-text' : 'oc-clip-other');

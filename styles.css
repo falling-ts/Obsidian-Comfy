@@ -95,6 +95,13 @@
   white-space: nowrap;
 }
 
+/* 源 md 里的 <br> 保留在 DOM 中, 但渲染时不占行(其前已补空格分隔),
+   这样整格内容始终只有一行, 超出部分由 .oc-clip 的省略号收尾 */
+.oc-clip br,
+.oc-clip br.oc-br-hidden {
+  display: none;
+}
+
 .oc-clip-text {
   max-width: var(--oc-text-max, 420px);
 }
