@@ -81,6 +81,44 @@ function colType(header) {
 }
 
 /**
+ * 把一行 markdown 表格切成单元格, 并记下每格在行内的字符区间。
+ *
+ * 之所以要区间而不只是文本, 是为了保存时只替换目标单元格那一段字符,
+ * 同行其它单元格的原始写法(空格/对齐)一个字符都不会被改动。
+ * 同时正确跳过 `\|` 这种转义竖线, 不会把一格误切成两格。
+ *
+ * @param {string} line 表格行原文
+ * @returns {Array<{text: string, start: number, end: number}>} 单元格数组;
+ *          第 0 项是行首 `|` 之前的内容(通常为空串), 因此第 i 列对应下标 i+1
+ */
+function splitCells(line) {
+  const src = String(line || '');
+  const out = [];
+  let text = '';
+  let start = -1;
+  for (let i = 0; i < src.length; i++) {
+    if (src[i] === '\\' && src[i + 1] === '|') {
+      if (start < 0) start = i;
+      text += '\\|';
+      i++;
+      continue;
+    }
+    if (src[i] === '|') {
+      const head = start < 0 ? i : start;
+      out.push({ text, start: head, end: head + text.length });
+      text = '';
+      start = -1;
+      continue;
+    }
+    if (start < 0) start = i;
+    text += src[i];
+  }
+  const head = start < 0 ? src.length : start;
+  out.push({ text, start: head, end: head + text.length });
+  return out;
+}
+
+/**
  * 提取 ID 的排序键: 取开头的数字段。
  *
  * @param {string} text 单元格文本, 例如 `00011-插入项`
@@ -482,6 +520,120 @@ class ComfyFileModal extends Modal {
   }
 }
 
+// ─── TEXT 单元格编辑器 ──────────────────────────────────────────────────
+
+/**
+ * 在文件全文里定位某个 ID 那一行的第 colIdx 个单元格。
+ *
+ * 返回的是该单元格内容在全文中的**绝对字符区间**, 保存时只替换这一段,
+ * 因此同一行其它单元格、表格其它行、文件里任何别的内容都不会被改动。
+ * 每次写盘前重新定位一次, 即使弹窗开着时文件被别处改过也不会写错位置。
+ *
+ * @param {string} data 文件全文
+ * @param {string} idText 目标行的 ID 列文本
+ * @param {number} colIdx 目标列下标(0 为 ID 列)
+ * @returns {{start: number, end: number, text: string}|null} 命中区间; 未命中为 null
+ */
+function locateCell(data, idText, colIdx) {
+  const src = String(data || '');
+  const want = String(idText || '').trim();
+  if (!want || colIdx < 1) return null;
+
+  const lines = src.split('\n');
+  let offset = 0;
+  for (const line of lines) {
+    if (line.trim().startsWith('|')) {
+      const cells = splitCells(line);
+      // cells[0] 是行首 `|` 之前的内容, 所以第 i 列是 cells[i + 1]
+      if (cells.length > colIdx + 1 && cells[1].text.trim() === want) {
+        const cell = cells[colIdx + 1];
+        return { start: offset + cell.start, end: offset + cell.end, text: cell.text };
+      }
+    }
+    offset += line.length + 1; // +1 为换行符
+  }
+  return null;
+}
+
+/**
+ * 双击 TEXT 单元格弹出的编辑器。
+ *
+ * 只负责查看与编辑, 不碰文件; 写回交给回调做区间替换。
+ */
+class ComfyTextModal extends Modal {
+  /**
+   * @param {App} app Obsidian App
+   * @param {object} opts 配置项
+   * @param {string} opts.title 标题(通常是 `ID · 列名`)
+   * @param {string} opts.value 单元格原文
+   * @param {(next: string) => Promise<void>} opts.onSave 保存回调
+   */
+  constructor(app, opts) {
+    super(app);
+    this.opts = opts;
+    this.saving = false;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.addClass('oc-text-modal');
+
+    contentEl.createEl('div', { cls: 'oc-text-head', text: this.opts.title });
+    contentEl.createEl('div', {
+      cls: 'oc-text-sub',
+      text: '只替换这一个单元格, 不动其它数据。换行写作 <br>, Ctrl/Cmd+Enter 保存。',
+    });
+
+    const area = contentEl.createEl('textarea', { cls: 'oc-text-area' });
+    area.value = this.opts.value;
+    area.spellcheck = false;
+
+    const bar = contentEl.createDiv({ cls: 'oc-text-bar' });
+    bar.createEl('button', { text: '取消' }).addEventListener('click', () => this.close());
+    bar.createEl('button', { text: '保存', cls: 'mod-cta' })
+      .addEventListener('click', () => this.doSave(area.value));
+
+    area.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) {
+        ev.preventDefault();
+        this.doSave(area.value);
+      }
+    });
+
+    area.focus();
+    area.setSelectionRange(area.value.length, area.value.length);
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+
+  /**
+   * 保存: 内容未变则直接关闭, 变了才回调写盘。
+   *
+   * @param {string} next 编辑框当前内容
+   * @returns {Promise<void>}
+   */
+  async doSave(next) {
+    if (this.saving) return;
+    if (next === this.opts.value) {
+      this.close();
+      return;
+    }
+    this.saving = true;
+    try {
+      await this.opts.onSave(next);
+    } finally {
+      this.saving = false;
+      this.close();
+    }
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
 // ─── 表格增强 ────────────────────────────────────────────────────────────
 
 class ComfyTableChild extends MarkdownRenderChild {
@@ -489,11 +641,16 @@ class ComfyTableChild extends MarkdownRenderChild {
    * @param {HTMLElement} containerEl 表格所在容器
    * @param {HTMLElement} table 原始 table 元素
    * @param {object} plugin 插件实例
+   * @param {MarkdownPostProcessorContext} ctx 渲染上下文(用于取源文件路径)
    */
-  constructor(containerEl, table, plugin) {
+  constructor(containerEl, table, plugin, ctx) {
     super(containerEl);
     this.table = table;
     this.plugin = plugin;
+    /** 渲染上下文 */
+    this.ctx = ctx || null;
+    /** 源文件路径: 双击编辑后要写回这个文件 */
+    this.sourcePath = ctx && ctx.sourcePath ? ctx.sourcePath : '';
 
     /** 表头列名(已去类型标注) */
     this.headers = [];
@@ -530,7 +687,90 @@ class ComfyTableChild extends MarkdownRenderChild {
 
     this.applyCellClasses(headRow);
     this.buildShell(headRow);
+    this.bindEdit();
     this.apply();
+  }
+
+  /**
+   * 绑定 TEXT 单元格双击 → 弹窗查看/编辑。
+   *
+   * 走事件委托挂在容器上, 这样排序、分页、搜索重排行之后依然有效。
+   *
+   * @returns {void}
+   */
+  bindEdit() {
+    this.registerDomEvent(this.containerEl, 'dblclick', (ev) => {
+      const clip = ev.target && ev.target.closest ? ev.target.closest('.oc-clip-text') : null;
+      if (!clip) return;
+      const td = clip.closest('td');
+      const tr = clip.closest('tr');
+      if (!td || !tr) return;
+      const cells = Array.from(tr.children);
+      const colIdx = cells.indexOf(td);
+      if (colIdx < 1 || !cells[0]) return; // 第 0 列是 ID, 不可编辑
+      ev.preventDefault();
+      ev.stopPropagation();
+      this.openTextEditor(cells[0].textContent.trim(), colIdx);
+    });
+  }
+
+  /**
+   * 读出该单元格的**源文本**, 弹窗展示。
+   *
+   * 特意从文件重新读, 而不是用 DOM 文本: DOM 里的 <br> 已被渲染处理过,
+   * 只有源文本才是保存时该回写的那一份。
+   *
+   * @param {string} idText 目标行 ID
+   * @param {number} colIdx 目标列下标
+   * @returns {Promise<void>}
+   */
+  async openTextEditor(idText, colIdx) {
+    const file = this.plugin.app.vault.getFileByPath(this.sourcePath);
+    if (!file) {
+      new Notice('找不到源文件, 无法编辑');
+      return;
+    }
+    const data = await this.plugin.app.vault.read(file);
+    const hit = locateCell(data, idText, colIdx);
+    if (!hit) {
+      new Notice(`源文件里没定位到 ${idText} 的这一列`);
+      return;
+    }
+    new ComfyTextModal(this.plugin.app, {
+      title: `${idText} · ${this.headers[colIdx] || ''}`,
+      value: hit.text.trim(),
+      onSave: (next) => this.writeCell(idText, colIdx, next),
+    }).open();
+  }
+
+  /**
+   * 写回: 只替换该单元格那一段字符, 其余内容一个字节都不动。
+   *
+   * 用 vault.process 做原子读改写, 并在回调内**重新定位**一次,
+   * 免得弹窗开着期间文件被别处改动而写错位置。
+   *
+   * @param {string} idText 目标行 ID
+   * @param {number} colIdx 目标列下标
+   * @param {string} next 新内容
+   * @returns {Promise<void>}
+   */
+  async writeCell(idText, colIdx, next) {
+    const file = this.plugin.app.vault.getFileByPath(this.sourcePath);
+    if (!file) {
+      new Notice('找不到源文件, 保存失败');
+      return;
+    }
+    let done = false;
+    await this.plugin.app.vault.process(file, (data) => {
+      const hit = locateCell(data, idText, colIdx);
+      if (!hit) return data;
+      // 沿用该格原有的首尾空白写法, 保持表格对齐风格不变
+      const lead = /^\s*/.exec(hit.text)[0];
+      const tail = /\s*$/.exec(hit.text)[0];
+      done = true;
+      return data.slice(0, hit.start) + lead + next + tail + data.slice(hit.end);
+    });
+    new Notice(done ? `已保存 ${idText}` : `保存失败: 没定位到 ${idText}`);
   }
 
   /**
@@ -986,7 +1226,7 @@ class ComfyPlugin extends Plugin {
         if (table.hasClass('oc-done')) continue;
         table.addClass('oc-done');
         // 交给 ctx 托管, 阅读视图重渲染时会自动卸载
-        ctx.addChild(new ComfyTableChild(el, table, this));
+        ctx.addChild(new ComfyTableChild(el, table, this, ctx));
       }
     });
 

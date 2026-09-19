@@ -177,6 +177,13 @@
   font-size: var(--font-ui-smaller, 12px);
 }
 
+/* 每页条数下拉: 宽度固定 + 文本居中, 免得数字贴着左边 */
+.oc-pager select {
+  min-width: 58px;
+  text-align: center;
+  text-align-last: center;
+}
+
 .oc-pager input.oc-jump {
   width: 52px;
   text-align: center;
@@ -344,3 +351,34 @@
 .oc-preview-box audio {
   width: 100%;
 }
+
+/* ─── TEXT 单元格编辑弹窗 ─── */
+.oc-text-modal .oc-text-head {
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+
+.oc-text-modal .oc-text-sub {
+  font-size: var(--font-ui-smaller, 12px);
+  color: var(--text-muted);
+  margin-bottom: 10px;
+}
+
+.oc-text-modal .oc-text-area {
+  width: 100%;
+  min-height: 46vh;
+  resize: vertical;
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller, 12px);
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.oc-text-modal .oc-text-bar {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}
+
