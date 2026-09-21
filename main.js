@@ -9,7 +9,7 @@
  *   3. 完整分页: 每页数量选择 / 首页 / 上一页 / 页码 / 下一页 / 尾页 / 跳转
  *   4. 表格上方搜索过滤
  *   5. ID 列点击切换增序 / 降序
- *   6. 在表格内输入 @ 自动弹窗浏览 ComfyUI output 目录(仅普通文件 + 「数字-」编号目录),
+ *   6. 在表格内输入 @ 自动弹窗浏览 ComfyUI output 目录(仅普通文件 + 「数字-」/「数字_」编号目录),
  *      选中文件后确定, 自动插入 @{目录名/文件名} 或 @{文件名}
  *   7. 双击单元格就地编辑: TEXT 弹多行编辑器; IMAGE/VIDEO/AUDIO/MASK 弹同一个文件
  *      浏览器并写入 @{...}; INT/FLOAT 就地换成输入框, 失焦即写回
@@ -33,8 +33,8 @@ const VIDEO_EXT = new Set(['mp4', 'webm', 'mov', 'mkv', 'm4v', 'avi']);
 /** 音频扩展名 → 弹窗里用音频图标 + 可播放 */
 const AUDIO_EXT = new Set(['mp3', 'wav', 'flac', 'ogg', 'm4a', 'aac', 'opus']);
 
-/** 编号目录判据: 数字开头后接连字符, 例如 0040-文生视频 */
-const NUMBERED_DIR_RE = /^\d+-/;
+/** 编号目录判据: 数字开头后接连字符或下划线, 例如 0040_文生视频 */
+const NUMBERED_DIR_RE = /^\d+[-_]/;
 
 /** 引用型列: 双击弹 output 文件浏览器, 选中后把 `@{...}` 写回该格 */
 const REF_TYPES = new Set(['IMAGE', 'VIDEO', 'AUDIO', 'MASK']);
@@ -274,7 +274,7 @@ class ComfyFileModal extends Modal {
       if (e.name.startsWith('.')) continue;
       const full = path.join(dir, e.name);
       if (e.isDirectory()) {
-        // 只显示「数字-」编号目录(与 ComfyUI 插件侧判据一致)
+        // 只显示「数字-」/「数字_」编号目录(与 ComfyUI 插件侧判据一致)
         if (!this.sub && NUMBERED_DIR_RE.test(e.name)) dirs.push({ name: e.name, isDir: true });
         continue;
       }
@@ -381,7 +381,7 @@ class ComfyFileModal extends Modal {
 
     contentEl.createDiv({
       cls: 'oc-hint',
-      text: '只列出普通文件与「数字-」编号目录; 目录内选中文件后可再返回上一级。',
+      text: '只列出普通文件与「数字-」/「数字_」编号目录; 目录内选中文件后可再返回上一级。',
     });
   }
 
@@ -510,7 +510,7 @@ class ComfyFileModal extends Modal {
   /**
    * 计算当前选中项对应的引用文本。
    *
-   * @returns {string} 例如 `@{0040-文生视频/video}`; 未选中时为空串
+   * @returns {string} 例如 `@{0040_文生视频/video}`; 未选中时为空串
    */
   currentRef() {
     if (!this.picked) return '';
