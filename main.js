@@ -14,6 +14,9 @@
  *   7. 双击单元格就地编辑: TEXT 弹多行编辑器; IMAGE/VIDEO/AUDIO/MASK 弹同一个文件
  *      浏览器并写入 @{...}; INT/FLOAT 就地换成输入框, 失焦即写回
  *   8. 所有写回都只替换目标单元格那一段字符, 同行其它格与文件其它内容一个字节不动
+ *   9. 文件浏览器排序: 接管 FileExplorer 的 getSortedFolderItems, 按「编号分层」重排,
+ *      让 00110_万物建模2.1 紧跟 0011_万物建模 之后
+ *      (Obsidian 原生是自然排序, 会把 5 位编号当作数值 110 甩到最后)
  */
 
 const obsidian = require('obsidian');
@@ -64,6 +67,8 @@ const DEFAULT_SETTINGS = {
   thumbWidth: 72,
   /** 记住用户手动选的每页数量 */
   lastPageSize: 20,
+  /** 文件浏览器排序: off(不接管) | prefix(编号分层) | byte(纯逐字节) */
+  explorerSort: 'prefix',
 };
 
 // ─── 通用小工具 ──────────────────────────────────────────────────────────
@@ -1243,6 +1248,66 @@ function pageWindow(page, pages, width) {
   return out;
 }
 
+// ─── 文件浏览器排序 ──────────────────────────────────────────────────────
+
+/**
+ * 逐字节比较两个字符串。
+ *
+ * JS 的 `<` 用在字符串上就是逐 UTF-16 code unit 比较, 不做数值化处理,
+ * 所以 `00110_万物建模2.1` 会排在 `0011_万物建模` 之前
+ * (第 5 个字符 `1` = 0x31 小于 `_` = 0x5F)。
+ *
+ * @param {string} a 左值
+ * @param {string} b 右值
+ * @returns {number} 负数 / 0 / 正数
+ */
+function compareByte(a, b) {
+  if (a === b) return 0;
+  return a < b ? -1 : 1;
+}
+
+/**
+ * 编号分层比较: 开头的数字串先按逐字节比较, 相同再比其余部分。
+ *
+ * 关键在于开头数字串按字符串比而非按数值比:
+ * `0011` 是 `00110` 的前缀, 于是 `0011_万物建模` 排在 `00110_万物建模2.1` 之前;
+ * 而 `00110` 与 `0012` 在第 4 位就分出 `1` < `2`, 所以 5 位编号恰好插在
+ * 它所属的 4 位编号之后、下一个编号之前。这正是故事库
+ * 「在编号末尾追加一位数字做中间插入」的编号体系所要求的顺序。
+ *
+ * @param {string} a 左文件名
+ * @param {string} b 右文件名
+ * @returns {number} 负数 / 0 / 正数
+ */
+function compareNumberedName(a, b) {
+  const numA = /^\d+/.exec(a);
+  const numB = /^\d+/.exec(b);
+  if (numA && numB) {
+    const byNumber = compareByte(numA[0], numB[0]);
+    if (byNumber !== 0) return byNumber;
+    return compareByte(a.slice(numA[0].length), b.slice(numB[0].length));
+  }
+  if (numA) return -1;
+  if (numB) return 1;
+  return compareByte(a, b);
+}
+
+/**
+ * 沿原型链找到真正定义某方法的对象, 便于替换后精确还原。
+ *
+ * @param {object} obj 起始对象
+ * @param {string} name 方法名
+ * @returns {object|null} 定义该方法的对象; 找不到返回 null
+ */
+function findMethodOwner(obj, name) {
+  let cur = obj;
+  while (cur) {
+    if (Object.prototype.hasOwnProperty.call(cur, name)) return cur;
+    cur = Object.getPrototypeOf(cur);
+  }
+  return null;
+}
+
 // ─── 设置页 ──────────────────────────────────────────────────────────────
 
 class ComfySettingTab extends PluginSettingTab {
@@ -1347,6 +1412,21 @@ class ComfySettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
+      .setName('文件浏览器排序')
+      .setDesc('编号分层: 0011_万物建模 → 00110_万物建模2.1 → 0012_万物变化; 纯逐字节: 只按 UTF-16 码位比文件名')
+      .addDropdown((d) => d
+        .addOption('prefix', '编号分层(推荐)')
+        .addOption('byte', '纯逐字节')
+        .addOption('off', '关闭')
+        .setValue(this.plugin.settings.explorerSort)
+        .onChange(async (v) => {
+          this.plugin.settings.explorerSort = v;
+          await this.plugin.saveSettings();
+          this.plugin.setupExplorerSort();
+          this.plugin.refreshExplorerSort();
+        }));
+
+    new Setting(containerEl)
       .setName('缩略图取图方式')
       .setDesc('app = app://local 协议(推荐); base64 = 读文件转 data URL(兼容性最好但占内存)')
       .addDropdown((d) => d
@@ -1427,6 +1507,10 @@ class ComfyPlugin extends Plugin {
 
     // 4) 设置页
     this.addSettingTab(new ComfySettingTab(this.app, this));
+
+    // 5) 文件浏览器排序; layout 变化时重装, 以防 file-explorer 视图被重建
+    this.setupExplorerSort();
+    this.registerEvent(this.app.workspace.on('layout-change', () => this.setupExplorerSort()));
   }
 
   /**
@@ -1435,7 +1519,8 @@ class ComfyPlugin extends Plugin {
    * @returns {void}
    */
   onunload() {
-    // 交由 Obsidian 处理已注册资源
+    this.teardownExplorerSort();
+    // 其余交由 Obsidian 处理已注册资源
   }
 
   /**
@@ -1471,6 +1556,76 @@ class ComfyPlugin extends Plugin {
    */
   async saveSettings() {
     await this.saveData(this.settings);
+  }
+
+  /**
+   * 接管文件浏览器的排序。
+   *
+   * 替换 FileExplorer 原型上的 `getSortedFolderItems`, 保留 Obsidian 原实现里
+   * 「文件夹排在前, 再从 this.fileItems 取回渲染项」的骨架, 只换比较器 ——
+   * 于是不依赖 items 的内部结构, 也不需要在视图重建后重新挂载。
+   *
+   * @returns {void}
+   */
+  setupExplorerSort() {
+    if (this.settings.explorerSort === 'off') {
+      this.teardownExplorerSort();
+      return;
+    }
+    const leaf = this.app.workspace.getLeavesOfType('file-explorer')[0];
+    const view = leaf && leaf.view;
+    if (!view || typeof view.getSortedFolderItems !== 'function') return;
+
+    const owner = findMethodOwner(view, 'getSortedFolderItems');
+    if (!owner || owner.__ocOriginalGetSortedFolderItems) return;
+
+    const plugin = this;
+    owner.__ocOriginalGetSortedFolderItems = owner.getSortedFolderItems;
+    owner.getSortedFolderItems = function (folder) {
+      if (!folder || !Array.isArray(folder.children)) {
+        return owner.__ocOriginalGetSortedFolderItems.call(this, folder);
+      }
+      const byName = plugin.settings.explorerSort === 'byte'
+        ? (x, y) => compareByte(x.name, y.name)
+        : (x, y) => compareNumberedName(x.name, y.name);
+      const children = folder.children.slice().sort((x, y) => {
+        const xFolder = x instanceof obsidian.TFolder;
+        const yFolder = y instanceof obsidian.TFolder;
+        if (xFolder !== yFolder) return xFolder ? -1 : 1;
+        return byName(x, y);
+      });
+      const items = [];
+      for (const entry of children) {
+        const item = this.fileItems[entry.path];
+        if (item) items.push(item);
+      }
+      return items;
+    };
+    this.explorerSortOwner = owner;
+  }
+
+  /**
+   * 还原文件浏览器排序, 把原型方法换回去。
+   *
+   * @returns {void}
+   */
+  teardownExplorerSort() {
+    const owner = this.explorerSortOwner;
+    if (!owner || !owner.__ocOriginalGetSortedFolderItems) return;
+    owner.getSortedFolderItems = owner.__ocOriginalGetSortedFolderItems;
+    delete owner.__ocOriginalGetSortedFolderItems;
+    this.explorerSortOwner = null;
+  }
+
+  /**
+   * 让文件浏览器按当前设置立刻重排。
+   *
+   * @returns {void}
+   */
+  refreshExplorerSort() {
+    for (const leaf of this.app.workspace.getLeavesOfType('file-explorer')) {
+      if (leaf.view && typeof leaf.view.requestSort === 'function') leaf.view.requestSort();
+    }
   }
 
   /**
