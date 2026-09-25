@@ -739,6 +739,8 @@ function restoreRefText(root) {
     const ems = cell.querySelectorAll('em');
     if (ems.length !== 1) continue;
     const em = ems[0];
+    // <em> 覆盖的必须正好是「名字/编号」这一段, 否则是格内本就有的强调 → 不碰
+    if (em.textContent !== m[2] + '/' + m[3]) continue;
     const doc = cell.ownerDocument || document;
     em.replaceWith(doc.createTextNode('_' + em.textContent + '_'));
     fixed += 1;
