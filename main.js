@@ -17,6 +17,9 @@
  *   9. 文件浏览器排序: 接管 FileExplorer 的 getSortedFolderItems, 按「编号分层」重排,
  *      让 00110_万物建模2.1 紧跟 0011_万物建模 之后
  *      (Obsidian 原生是自然排序, 会把 5 位编号当作数值 110 甩到最后)
+ *  10. 引用原文还原: `@{表名_编号/行ID_名称}` 里的下划线会被 Markdown 的强调语法
+ *      当强调吃掉(中文紧邻下划线时 Obsidian 判定失效, 属其已知问题), 阅读视图与编辑
+ *      模式实时渲染的表格单元格都在显示层把原文补回, md 源码一个字节不动
  */
 
 const obsidian = require('obsidian');
@@ -44,6 +47,9 @@ const REF_TYPES = new Set(['IMAGE', 'VIDEO', 'AUDIO', 'MASK']);
 
 /** 数值型列: 双击就地换成输入框, 失焦时写回该格 */
 const NUM_TYPES = new Set(['INT', 'FLOAT']);
+
+/** 引用原文还原判据: `@{表名数字+名字/行ID数字+名字}`, 即两条下划线都被强调吃掉时的形态 */
+const REF_TEXT_RE = /^@\{(\d+)([^/}]*)\/(\d+)([^/}]*)\}$/;
 
 /** 默认设置 */
 const DEFAULT_SETTINGS = {
@@ -144,6 +150,32 @@ function splitCells(line) {
 function splitBrText(text) {
   const parts = String(text == null ? '' : text).split(/<br\s*\/?>/i);
   return parts.map((seg, i) => ({ br: i > 0, text: seg.replace(/\\\|/g, '|') }));
+}
+
+/**
+ * 弹窗显示用: 把源码里的 `<br>` 换成**真实换行**, 让编辑框按段落行。
+ *
+ * 只认 `<br>` 这一个标签(`<br>` / `<br/>` / `<br />` / 大小写混写都算),
+ * 写成别的 HTML 一律当普通文字原样显示 —— 单元格里除了 `<br>` 没有别的标签。
+ *
+ * @param {string} text 单元格源文本
+ * @returns {string} 换行已还原成 `\n` 的文本
+ */
+function brToNewline(text) {
+  return String(text == null ? '' : text).replace(/<br\s*\/?>/gi, '\n');
+}
+
+/**
+ * 保存用: 把真实换行换回源码里的 `<br>`, 保证单元格仍是**单行**、表格形状不变。
+ *
+ * 先归一 CRLF/CR(粘贴进来的内容可能带 `\r`), 再统一写成小写无斜杠的 `<br>`;
+ * 除换行以外一个字符都不动。
+ *
+ * @param {string} text 编辑框里的文本
+ * @returns {string} 可回写进单元格的文本
+ */
+function newlineToBr(text) {
+  return String(text == null ? '' : text).replace(/\r\n?/g, '\n').replace(/\n/g, '<br>');
 }
 
 /**
@@ -588,6 +620,10 @@ function locateCell(data, idText, colIdx) {
 /**
  * 双击 TEXT 单元格弹出的编辑器。
  *
+ * 显示与保存走同一套 `<br>` 约定: 源码单元格里的 `<br>` 在编辑框里渲染成
+ * **真实换行**(编辑、粘贴都按行来), 保存时再把换行换回 `<br>` 写回源文件。
+ * 于是编辑框所见即段落, 而磁盘上的单元格永远是单行、不破坏表格形状。
+ *
  * 只负责查看与编辑, 不碰文件; 写回交给回调做区间替换。
  */
 class ComfyTextModal extends Modal {
@@ -595,13 +631,17 @@ class ComfyTextModal extends Modal {
    * @param {App} app Obsidian App
    * @param {object} opts 配置项
    * @param {string} opts.title 标题(通常是 `ID · 列名`)
-   * @param {string} opts.value 单元格原文
+   * @param {string} opts.value 单元格原文(带字面 `<br>`)
    * @param {(next: string) => Promise<void>} opts.onSave 保存回调
    */
   constructor(app, opts) {
     super(app);
     this.opts = opts;
     this.saving = false;
+    /** 单元格原文, 保存时用来判断内容有没有真的改过 */
+    this.raw = String(opts.value == null ? '' : opts.value);
+    /** 编辑框初值: `<br>` 已还原成真实换行 */
+    this.display = brToNewline(this.raw);
   }
 
   onOpen() {
@@ -611,11 +651,11 @@ class ComfyTextModal extends Modal {
     contentEl.createEl('div', { cls: 'oc-text-head', text: this.opts.title });
     contentEl.createEl('div', {
       cls: 'oc-text-sub',
-      text: '只替换这一个单元格, 不动其它数据。换行写作 <br>, Ctrl/Cmd+Enter 保存。',
+      text: '只替换这一个单元格, 不动其它数据。直接回车换行, 保存时自动转成 <br>; Ctrl/Cmd+Enter 保存。',
     });
 
     const area = contentEl.createEl('textarea', { cls: 'oc-text-area' });
-    area.value = this.opts.value;
+    area.value = this.display;
     area.spellcheck = false;
 
     const bar = contentEl.createDiv({ cls: 'oc-text-bar' });
@@ -639,20 +679,21 @@ class ComfyTextModal extends Modal {
   }
 
   /**
-   * 保存: 内容未变则直接关闭, 变了才回调写盘。
+   * 保存: 换行转回 `<br>` 后与原文件内容比对, 内容未变则直接关闭, 变了才回调写盘。
    *
-   * @param {string} next 编辑框当前内容
+   * @param {string} next 编辑框当前内容(真实换行)
    * @returns {Promise<void>}
    */
   async doSave(next) {
     if (this.saving) return;
-    if (next === this.opts.value) {
+    const text = newlineToBr(next);
+    if (text === this.raw) {
       this.close();
       return;
     }
     this.saving = true;
     try {
-      await this.opts.onSave(next);
+      await this.opts.onSave(text);
     } finally {
       this.saving = false;
       this.close();
@@ -662,6 +703,47 @@ class ComfyTextModal extends Modal {
   onClose() {
     this.contentEl.empty();
   }
+}
+
+// ─── 引用原文还原 ────────────────────────────────────────────────────────
+
+/**
+ * `@{表名_编号/行ID_名称}` 整格引用天然带两个下划线, 而 Obsidian 的 Markdown 解析会把
+ * 它们当成强调字符对: 阅读视图与编辑模式的实时渲染都会输出去掉下划线的文本, 并把中间
+ * 那段变成 `<em>` 斜体(它判定「词内下划线」时只认 ASCII 词字符, 下划线紧挨中文就失效,
+ * 属其已知问题; md 源码一个字节没动, 坏的只是显示)。
+ *
+ * 这里按固定约定 `@{(数字)(名字)/(数字)(名字)}` 把下划线补回: 只把那个 `<em>` 换回字面
+ * 文本 `_内容_`, 单元格其余子节点一个不动; 已经渲染正确(或下划线本来就在)的格子直接跳过,
+ * 因此可重复执行, 也不会误伤真正用 `_` 写的强调文本。
+ *
+ * @param {HTMLElement} root 后处理器拿到的元素
+ * @returns {number} 实际修复的单元格个数
+ */
+function restoreRefText(root) {
+  if (!root || typeof root.querySelectorAll !== 'function') return 0;
+
+  // 阅读视图: root 是包含整个 table 的块 → 逐个单元格处理;
+  // 实时预览: Obsidian 的表格 widget 对每个单元格各跑一次后处理器, root 就是单元格内的
+  // `.table-cell-wrapper`(不含 td) → root 本身即目标
+  const cells = Array.from(root.querySelectorAll('td, th'));
+  const targets = cells.length > 0 ? cells : [root];
+
+  let fixed = 0;
+  for (const cell of targets) {
+    const flat = (cell.textContent || '').trim();
+    const m = REF_TEXT_RE.exec(flat);
+    // 两侧都必须「有名字、但下划线不见了」才是被强调吃掉; 否则保持原样
+    if (!m || !m[2] || !m[4]) continue;
+    if (m[2].startsWith('_') || m[4].startsWith('_')) continue;
+    const ems = cell.querySelectorAll('em');
+    if (ems.length !== 1) continue;
+    const em = ems[0];
+    const doc = cell.ownerDocument || document;
+    em.replaceWith(doc.createTextNode('_' + em.textContent + '_'));
+    fixed += 1;
+  }
+  return fixed;
 }
 
 // ─── 表格增强 ────────────────────────────────────────────────────────────
@@ -1475,8 +1557,12 @@ class ComfyPlugin extends Plugin {
     await this.loadSettings();
     this.applyCssVars();
 
-    // 1) 表格增强
+    // 1) 引用原文还原 + 表格增强
     this.registerMarkdownPostProcessor((el, ctx) => {
+      // 1a) `@{}` 里的下划线被 Markdown 当强调吃掉(斜体) → 显示层按约定补回;
+      //     阅读视图与实时预览的表格单元格都会走到这里, 与「启用表格增强」无关
+      restoreRefText(el);
+
       if (!this.settings.enableTable) return;
       const tables = el.querySelectorAll('table');
       for (const table of Array.from(tables)) {
